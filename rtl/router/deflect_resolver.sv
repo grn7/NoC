@@ -1,0 +1,161 @@
+// Runs every cycle ; fully combinational
+// Every transit flit that enters must EXIT
+// No flit is ever dropped 
+
+// 4-Pass Priority Algorithm (HopLite RT):
+// Pass 1 - Ejection first : arrived flits claim Local unconditionally 
+// Pass 2 - Transit claim : N/S/E/W flits claim desired output in priority order 
+// Pass 3 - Deflection : losers from Pass 2 grab any remaining free slot 
+// Pass 4 - PE Injection : gets a leftover slot or stalls (inj_ready = 0)
+
+
+module deflect_resolver
+
+    import noc_pkg::*;
+
+(
+
+    // Inputs from 5 splitter instances (one per input port)
+    // Index mapping: 0=N, 1=S, 2=E, 3=W, 4=PE
+    input logic valid_in [5],
+    input flit_t flit_in [5],
+
+    // desired[i] is a 5-bit one hot vector - which output flit i wants
+    // Index mapping: 0=N, 1=S, 2=E, 3=W, 4=L
+    // Produced by router_core by packing splitter's individual outputs
+    input logic[4:0] desired [5],
+
+    // is_eject[i] = 1 means flit i has reached its destination
+    // This is the same signal as to_local from the splitter , named separately here so the intent is explicit as this level
+    input logic is_eject [5],
+
+    // Output to 5 outputs , same index mapping as before
+    output logic valid_out [5],
+    output flit_t flit_out [5],
+
+    // Backpressure to PE - valid/ready handshake at PE boundary
+    // 1 - PE flit accepted this cycle; 0 - no free slot in network, PE must hold its flit and retry next cycle
+    output logic inj_ready
+);
+    
+    // Direction indices - must match 'desired' bit encoding above
+    localparam int DIR_N = 0;
+    localparam int DIR_S = 1;
+    localparam int DIR_E = 2;
+    localparam int DIR_W = 3;
+    localparam int DIR_L = 4; // Local (ejection output)
+
+    // Source port indices 
+    localparam int SRC_N = 0;
+    localparam int SRC_S = 1;
+    localparam int SRC_E = 2;
+    localparam int SRC_W = 3;
+    localparam int SRC_PE = 4;
+
+    // Internal signals 
+    logic [4:0] out_taken; // out_taken[d] = 1 once the output direction has been claimed
+    logic [3:0] deflected; // deflected[i] = 1 if transit flit i lost contention in Pass 2 and still needs to be assigned to some output in Pass 3 
+
+    always_comb begin
+
+        // Initialise clean slate every combinational evaulation
+        for(int d = 0; d<5; d++) begin
+            valid_out[d] = 1'b0;
+            flit_out[d] = '0;
+        end
+        out_taken = 5'b0;
+        deflected = 4'b0;
+        inj_ready = 1'b0;
+
+        // Pass 1 - Ejection first 
+        // Any transit flit that has reached its destination (is_eject=1) unconditonally claims Local output - Highest priority
+        // Ejection first breaks the possibility of looping forever
+        for(int i=0; i<4; i++) begin // transit inputs only (not PE)
+            if(valid_in[i] && is_eject[i]) begin
+                if(!out_taken[DIR_L]) begin // first highest priority ejector claims local
+                out_taken[DIR_L] = 1'b1;
+                valid_out[DIR_L] = 1'b1;
+                flit_out[DIR_L] = flit_in[i];
+                end
+                else begin
+                    // Second or upcoming ejectors lost contention for Local; must be deflected 
+                    deflected[i] = 1'b1;
+                end
+            end
+        end
+
+        // Pass 2 - Transit flits claim desired output 
+        // Fixed HopliteRT priority - N(0) > S(1) > E(2) > W(3)
+        // For each transit flit in priority order - 
+        // Find desired dest, if output is free claim it else mark flit as deflected
+        for(int i=0; i<4 ; i++) begin
+            if(valid_in[i] && !is_eject[i]) begin
+                for(int d=0; d<4; d++) begin // Local is already resolved in Pass 1
+                    if(desired[i][d]) begin // desired direction
+                        if(!out_taken[d]) begin // if free - claim it
+                            out_taken[d] = 1'b1;
+                            valid_out[d] = 1'b1;
+                            flit_out[d] = flit_in[i];
+                        end
+                        else begin // slot taken - needs deflection
+                            deflected[i] = 1'b1;
+                        end
+                        break; // once the one hot one is either claimed or deflected , checking remaining directions is pointless
+                    end
+                end
+            end
+        end
+
+        // Pass 3 - Deflect losers to any remaining free output 
+        // Every flit marked deflected[i] = 1 must be assigned somewhere, we can't drop in-flight packets
+        // We scan output slots from lowest index (DIR_N=0) upward and assign to 1st free one
+        // Deflected flits can go to any direction - even back to where they came from
+        for (int i=0; i<4; i++) begin
+            if(deflected[i]) begin
+                for(int d=0; d<4; d++) begin // shouldn't go to local
+                    if(!out_taken[d]) begin
+                        out_taken[d] = 1'b1;
+                        valid_out[d] = 1'b1;
+                        flit_out[d] = flit_in[i];
+                        break; // exactly one slot per deflected flit 
+                    end
+                end
+            end
+        end
+
+        // Pass 4: PE injection - Lowest priority
+        // The PE's new flit is only placed if a free network output (NOT the local slot - that is preserved for ejection) remains
+        // after all in-flight transit flits have been placed 
+        // 1st - Try PE's desired direction - best case 
+        // 2nd - Fall back to any free slot
+        // If still no slot - inj_ready stays 0
+        if(valid_in[SRC_PE]) begin
+
+            // desired direction
+            for(int d=0; d<4; d++) begin // d<4 - network outputs only
+                if(desired[SRC_PE][d] && !out_taken[d]) begin
+                    out_taken[d] = 1'b1;
+                    valid_out[d] = 1'b1;
+                    flit_out[d] = flit_in[SRC_PE];
+                    inj_ready = 1'b1;
+                    break;
+                end
+            end
+
+            // any remaining free slot
+            if(!inj_ready) begin
+                for(int d=0; d<4; d++) begin
+                    if(!out_taken[d]) begin
+                        out_taken[d] = 1'b1;
+                        valid_out[d] = 1'b1;
+                        flit_out[d] = flit_in[SRC_PE];
+                        inj_ready = 1'b1;
+                        break;
+                    end
+                end
+            end
+        end
+    end
+                
+
+endmodule
